@@ -41,6 +41,8 @@ var
   fullRedraw = false
   winchFlag = false
   running = true
+  emptyCmd = ""            # GHOSTLINE_EMPTY_CMD: run on double-Enter
+  emptySubmits = 0
 
 proc writeStr(fd: cint, s: string) =
   ## Write all of `s` to `fd`, retrying on partial writes and EINTR.
@@ -387,14 +389,24 @@ proc submit() =
   promptRows = 0
   promptLast = 0
   drawn = false
-  if l.len > 0 and (hist.len == 0 or hist[^1] != l):
-    hist.add l
+  if l.len > 0:
+    emptySubmits = 0
+    if hist.len == 0 or hist[^1] != l:
+      hist.add l
+  else:
+    inc emptySubmits
+    if emptySubmits >= 2 and emptyCmd.len > 0:
+      emptySubmits = 0
+      writeStr(mfd, emptyCmd & "\n")
+      dirty = false
+      return
   writeStr(mfd, l & "\n")
   dirty = false
 
 proc interrupt() =
   ## C-c: discard the line and forward SIGINT to the child's foreground
   ## process group, letting bash print its own '^C' and a fresh prompt.
+  emptySubmits = 0
   if drawn: eraseLine()
   line = ""
   cur = 0
@@ -555,6 +567,7 @@ proc main() =
     quit(127)
 
   putEnv("GHOSTLINE", "1")
+  emptyCmd = getEnv("GHOSTLINE_EMPTY_CMD")
 
   let histFile = getEnv("HISTFILE", getHomeDir() / ".bash_eternal_history")
   if fileExists(histFile):

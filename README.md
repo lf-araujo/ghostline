@@ -32,6 +32,16 @@ ble.sh must not load inside ghostline (it would fight over the terminal), so
       source ~/.local/share/blesh/ble.sh
     fi
 
+## Empty-command hook
+
+Set `GHOSTLINE_EMPTY_CMD` to a command that runs when you press Enter twice
+on an empty line — a stray single Enter still just gives a fresh prompt.
+In `~/.bashrc`:
+
+    export GHOSTLINE_EMPTY_CMD=nitch
+
+Any real command or C-c resets the count.
+
 ## Keys
 
 | Key            | Action                                  |
