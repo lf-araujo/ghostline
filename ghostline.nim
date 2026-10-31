@@ -1,7 +1,8 @@
-## ghostline — fish-style ghost autosuggestions for bash.
+## ghostline — fish-style ghost autosuggestions for bash and zsh.
 ##
-## An rlwrap-style pty wrapper: it runs bash on a pseudo-terminal, owns the
-## line editor itself, passes bash's real prompt through untouched, and draws
+## An rlwrap-style pty wrapper: it runs your shell (``$SHELL -i``, or any
+## command given) on a pseudo-terminal, owns the line editor itself, passes
+## the shell's real prompt through untouched, and draws
 ## a dim "ghost" completion (from history, else from the filesystem) that is
 ## accepted with →, End, C-f or TAB.
 
@@ -15,10 +16,10 @@ proc ptsname(fd: cint): cstring {.importc: "ptsname", header: "<stdlib.h>".}
 proc ioctlP(fd: cint, request: culong, arg: pointer): cint {.
   importc: "ioctl", header: "<sys/ioctl.h>", varargs.}
 
-const
-  TIOCSWINSZ = culong(0x5414)
-  TIOCSCTTY = culong(0x540E)
-  SIGWINCH = 28.cint          # Linux
+var
+  TIOCSWINSZ {.importc, header: "<sys/ioctl.h>".}: culong
+  TIOCSCTTY {.importc, header: "<sys/ioctl.h>".}: culong
+  SIGWINCH {.importc, header: "<signal.h>".}: cint
 
 var
   mfd: cint = -1            # pty master
@@ -100,31 +101,6 @@ proc runeWidth(r: int32): int =
     return 2
   1
 
-proc stripAnsi(s: string): string =
-  ## Remove ANSI escape sequences (CSI, OSC, two-byte ESC) so the result's
-  ## width reflects only visible text.
-  result = ""
-  var i = 0
-  while i < s.len:
-    if s[i] == '\x1b':
-      inc i
-      if i < s.len and s[i] == '[':
-        inc i
-        while i < s.len and s[i].ord < 0x40: inc i
-        if i < s.len: inc i
-      elif i < s.len and s[i] == ']':
-        inc i
-        while i < s.len:
-          if s[i] == '\x07': inc i; break
-          if s[i] == '\x1b' and i + 1 < s.len and s[i+1] == '\\':
-            inc(i, 2); break
-          inc i
-      elif i < s.len:
-        inc i
-    else:
-      result.add s[i]
-      inc i
-
 proc strWidth(s: string): int =
   ## Sum of the terminal column widths of all runes in `s`.
   var i = 0
@@ -135,18 +111,51 @@ proc strWidth(s: string): int =
 proc layout(s: string): tuple[rows, last: int] =
   ## Geometry of a possibly multi-line prompt: how many rows precede its
   ## last line, and the width of that last line.
-  let t = stripAnsi(s)
+  ## Carriage returns, backspaces and CSI cursor-forward/back are honoured,
+  ## since zsh's line editor positions the cursor with them (PROMPT_SP,
+  ## redraws); other escape sequences take no width.
   var row = 0
   var w = 0
   var i = 0
-  while i < t.len:
-    let r = nextRune(t, i)
-    if r == 10:
-      inc row, (w div cols) + 1
-      w = 0
+  while i < s.len:
+    let c = s[i]
+    if c == '\x1b':
+      inc i
+      if i < s.len and s[i] == '[':
+        inc i
+        let p0 = i
+        while i < s.len and s[i].ord < 0x40: inc i
+        if i < s.len:
+          let n = (try: parseInt(s[p0 ..< i]) except ValueError: 1)
+          case s[i]
+          of 'C': inc w, max(n, 1)
+          of 'D': w = max(0, w - max(n, 1))
+          of 'G': w = max(0, max(n, 1) - 1)
+          else: discard
+          inc i
+      elif i < s.len and s[i] == ']':
+        inc i
+        while i < s.len:
+          if s[i] == '\x07': inc i; break
+          if s[i] == '\x1b' and i + 1 < s.len and s[i+1] == '\\':
+            inc(i, 2); break
+          inc i
+      elif i < s.len:
+        inc i
+    elif c == '\r':
+      w = w - (w mod cols)  # back to column 0 of the current screen row
+      inc i
+    elif c == '\b':
+      if w > 0: dec w
+      inc i
     else:
-      inc w, runeWidth(r)
-  (row, w)
+      let r = nextRune(s, i)
+      if r == 10:
+        inc row, (w div cols) + 1
+        w = 0
+      else:
+        inc w, runeWidth(r)
+  (row + w div cols, w mod cols)
 
 proc fileGhost(): string =
   ## Ghost completion for the current word as a filesystem path: the first
@@ -377,7 +386,7 @@ proc acceptGhost(): bool =
 
 proc submit() =
   ## Enter: send the line to the child shell and reset the editor. The
-  ## child's readline echoes the line itself, so only our drawing is
+  ## child's line editor (readline / ZLE) echoes the line itself, so only our drawing is
   ## erased first.
   if drawn: eraseLine()
   let l = line
@@ -405,7 +414,7 @@ proc submit() =
 
 proc interrupt() =
   ## C-c: discard the line and forward SIGINT to the child's foreground
-  ## process group, letting bash print its own '^C' and a fresh prompt.
+  ## process group, letting the shell print its own '^C' and a fresh prompt.
   emptySubmits = 0
   if drawn: eraseLine()
   line = ""
@@ -544,6 +553,71 @@ proc pump() =
     prompt = ""
   dirty = true
 
+proc unmetafy(s: string): string =
+  ## Undo zsh's history "metafication": 0x83 marks the next byte XOR 32.
+  var i = 0
+  while i < s.len:
+    if s[i] == '\x83' and i + 1 < s.len:
+      result.add chr(s[i+1].ord xor 32)
+      inc i, 2
+    else:
+      result.add s[i]
+      inc i
+
+proc isDigits(s: string): bool =
+  s.len > 0 and s.allCharsInSet(Digits)
+
+proc addHist(l: string) =
+  ## Keep single-line, non-blank entries; skip consecutive duplicates.
+  if l.strip.len == 0 or '\n' in l: return
+  if hist.len == 0 or hist[^1] != l:
+    hist.add l
+
+proc loadHistory(path: string, zsh: bool) =
+  ## Read a bash or zsh history file into `hist`. zsh entries may carry an
+  ## EXTENDED_HISTORY header (": <time>:<secs>;cmd") and continue across
+  ## lines ending in a backslash; multi-line entries are dropped. Bash
+  ## HISTTIMEFORMAT stamps ("#<time>") are skipped.
+  if not fileExists(path): return
+  var pending = ""
+  var cont = false
+  for raw in lines(path):
+    var l = if zsh: unmetafy(raw) else: raw
+    if not zsh:
+      if l.len > 1 and l[0] == '#' and isDigits(l[1 .. ^1]): continue
+      addHist(l)
+      continue
+    if not cont and l.startsWith(": "):
+      let semi = l.find(';')
+      if semi > 2:
+        let hdr = l[2 ..< semi].split(':')
+        if hdr.len == 2 and isDigits(hdr[0]) and isDigits(hdr[1]):
+          l = l[semi + 1 .. ^1]
+    if l.endsWith("\\"):
+      pending.add l[0 .. ^2] & "\n"
+      cont = true
+      continue
+    pending.add l
+    cont = false
+    addHist(pending)
+    pending = ""
+
+proc historyPath(shell: string): string =
+  ## GHOSTLINE_HISTFILE, else an exported HISTFILE, else the shell's default.
+  result = getEnv("GHOSTLINE_HISTFILE", getEnv("HISTFILE"))
+  if result.len > 0: return
+  if shell == "zsh":
+    return getEnv("ZDOTDIR", getHomeDir()) / ".zsh_history"
+  let eternal = getHomeDir() / ".bash_eternal_history"
+  result = if fileExists(eternal): eternal
+           else: getHomeDir() / ".bash_history"
+
+proc shellCommand(): seq[string] =
+  ## The command to run: the arguments given, else ``$SHELL -i``.
+  result = commandLineParams()
+  if result.len == 0:
+    result = @[getEnv("SHELL", "/bin/bash"), "-i"]
+
 proc syncSize() =
   ## Adopt the real terminal's size and push it to the pty.
   var ws: IOctl_WinSize
@@ -560,8 +634,7 @@ proc main() =
   ## the select loop until the child exits.
   if isatty(0) == 0:
     # not a terminal: no line editing to do, just exec
-    var args = commandLineParams()
-    if args.len == 0: args = @["bash"]
+    let args = shellCommand()
     let cargv = allocCStringArray(args)
     discard execvp(cstring(args[0]), cargv)
     quit(127)
@@ -569,11 +642,9 @@ proc main() =
   putEnv("GHOSTLINE", "1")
   emptyCmd = getEnv("GHOSTLINE_EMPTY_CMD")
 
-  let histFile = getEnv("HISTFILE", getHomeDir() / ".bash_eternal_history")
-  if fileExists(histFile):
-    for l in lines(histFile):
-      if l.len > 0:
-        hist.add l
+  let args = shellCommand()
+  let shell = lastPathPart(args[0]).strip(chars = {'-'})
+  loadHistory(historyPath(shell), shell == "zsh")
 
   mfd = posixOpenpt(O_RDWR or O_NOCTTY)
   if mfd < 0:
@@ -594,11 +665,6 @@ proc main() =
     discard dup2(slave, 2)
     if slave > 2: discard close(slave)
     discard close(mfd)
-    var args: seq[string]
-    if commandLineParams().len > 0:
-      args = commandLineParams()
-    else:
-      args = @["bash", "-i"]
     let cargv = allocCStringArray(args)
     discard execvp(cstring(args[0]), cargv)
     quit(127)

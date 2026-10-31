@@ -1,8 +1,8 @@
 # Package
 
-version       = "0.2.0"
+version       = "0.3.0"
 author        = "lf-araujo"
-description   = "Fish-style ghost (phantom) autosuggestions for bash"
+description   = "Fish-style ghost (phantom) autosuggestions for bash and zsh"
 license       = "MIT"
 srcDir        = "."
 bin           = @["ghostline"]
