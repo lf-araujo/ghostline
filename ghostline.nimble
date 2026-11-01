@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.3.0"
+version       = "0.3.1"
 author        = "lf-araujo"
 description   = "Fish-style ghost (phantom) autosuggestions for bash and zsh"
 license       = "MIT"
