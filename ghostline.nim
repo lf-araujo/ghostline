@@ -44,6 +44,7 @@ var
   running = true
   emptyCmd = ""            # GHOSTLINE_EMPTY_CMD: run on double-Enter
   emptySubmits = 0
+  childBracketed = false     # child readline has bracketed paste on (?2004h)
 
 proc writeStr(fd: cint, s: string) =
   ## Write all of `s` to `fd`, retrying on partial writes and EINTR.
@@ -220,16 +221,21 @@ proc render() =
   else:
     anchorRow = pRows      # cursor already sits at the end of the prompt
   let g = ghost()
-  o.add line
+  # The terminal is raw (no OPOST), so a pasted LF must be drawn as CR LF or
+  # the next line starts where the previous one ended.
+  o.add line.replace("\n", "\r\n")
   if g.len > 0:
     o.add "\x1b[90m" & g & "\x1b[39m"
-  let cW = strWidth(line[0 ..< cur])
-  let lastW = pLast + strWidth(line) + strWidth(g)
-  let cursorRow = pRows + (pLast + cW) div cols
-  let cursorCol = (pLast + cW) mod cols
-  let afterRow = pRows + (if lastW == 0: 0
-                          elif lastW mod cols == 0: lastW div cols - 1
-                          else: lastW div cols)
+  # Geometry relative to the start of the prompt's last line; padding by the
+  # prompt width lets `layout` account for the first line's offset.
+  let pad = spaces(pLast)
+  let (cRows, cW) = layout(pad & line[0 ..< cur])
+  let (aRows, lastW) = layout(pad & line & g)
+  let cursorRow = pRows + cRows + cW div cols
+  let cursorCol = cW mod cols
+  let afterRow = pRows + aRows + (if lastW == 0: 0
+                                  elif lastW mod cols == 0: lastW div cols - 1
+                                  else: lastW div cols)
   o.add "\r"
   if afterRow > cursorRow:
     o.add "\x1b[" & $(afterRow - cursorRow) & "A"
@@ -409,7 +415,13 @@ proc submit() =
       writeStr(mfd, emptyCmd & "\n")
       dirty = false
       return
-  writeStr(mfd, l & "\n")
+  if childBracketed and (l.contains('\n') or l.contains('\t')):
+    # Hand a multi-line/tabbed line to readline as a paste: it then inserts
+    # it literally (no tab completion, no line-by-line execution) and the
+    # final LF runs it as one input, like pasting without ghostline.
+    writeStr(mfd, "\x1b[200~" & l & "\x1b[201~\n")
+  else:
+    writeStr(mfd, l & "\n")
   dirty = false
 
 proc interrupt() =
@@ -450,8 +462,9 @@ proc dispatchOne(): bool =
       if keys.startsWith("\x1b[200~"):     # bracketed paste
         let k = keys.find("\x1b[201~")
         if k < 0: return false
-        insertText(keys[6 ..< k])
-        keys.delete(0 .. k + 4)
+        # terminals send pasted newlines as CR (or CRLF); keep them as LF
+        insertText(keys[6 ..< k].replace("\r\n", "\n").replace('\r', '\n'))
+        keys.delete(0 .. k + 5)             # the end marker is 6 bytes
         return true
       var i = 2
       while i < keys.len and keys[i].ord < 0x40: inc i
@@ -523,9 +536,25 @@ proc dispatchOne(): bool =
   keys.delete(0 .. n - 1)
   true
 
+proc atShellPrompt(): bool =
+  ## True when the child shell's readline is waiting for a line: the shell
+  ## owns the pty's foreground and the pty is in non-canonical mode. Anything
+  ## else (a running command, a password prompt, `read -s`, a full-screen
+  ## program) must get the raw keys and its own echo settings.
+  if tcgetpgrp(mfd) != childPid: return false
+  var t: Termios
+  if tcGetAttr(mfd, addr t) != 0: return true
+  (t.c_lflag and ICANON) == 0
+
 proc handleInput(s: string) =
-  ## Append newly read bytes and dispatch as many keys as possible.
+  ## Append newly read bytes and dispatch as many keys as possible, or pass
+  ## them straight to the child when the shell is not at its prompt.
   keys.add s
+  if not atShellPrompt():
+    if drawn: eraseLine()
+    writeStr(mfd, keys)
+    keys = ""
+    return
   while dispatchOne():
     if not running: break
 
@@ -545,6 +574,11 @@ proc pump() =
     eraseLine()
   writeStr(1, s)
   anchorRow = 0
+  # track the child's bracketed-paste mode (the last toggle in this chunk wins)
+  let on = s.rfind("\x1b[?2004h")
+  let off = s.rfind("\x1b[?2004l")
+  if on >= 0 or off >= 0:
+    childBracketed = on > off
   prompt.add s
   let nl = prompt.rfind('\n')
   if nl >= 0:

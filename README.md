@@ -19,6 +19,11 @@ you type, ghostline draws a dim gray suggestion:
 - otherwise, from the filesystem — the first match for the current word
   (supports `~`)
 
+ghostline only edits while bash's readline is waiting for a command. When
+anything else reads the terminal (a running program, a password prompt,
+`read -s`, a full-screen app like vim or Claude Code), keys go straight
+through, so the terminal's own echo settings apply.
+
 ## Usage
 
     ./ghostline            # runs $SHELL -i
